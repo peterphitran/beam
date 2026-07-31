@@ -31,6 +31,7 @@ import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Sets;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.ContentScanTask;
+import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
@@ -38,20 +39,18 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.data.InternalRecordWrapper;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.data.parquet.GenericParquetReaders;
 import org.apache.iceberg.encryption.EncryptedFiles;
 import org.apache.iceberg.encryption.EncryptedInputFile;
 import org.apache.iceberg.expressions.Evaluator;
 import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.formats.FormatModelRegistry;
+import org.apache.iceberg.formats.ReadBuilder;
 import org.apache.iceberg.hadoop.HadoopInputFile;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
-import org.apache.iceberg.parquet.ParquetReader;
 import org.apache.iceberg.util.SnapshotUtil;
-import org.apache.parquet.HadoopReadOptions;
-import org.apache.parquet.ParquetReadOptions;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 /** Helper class for source operations. */
@@ -94,39 +93,30 @@ public class ReadUtils {
     InputFile inputFile = table.encryption().decrypt(encryptedInput);
     Map<Integer, ?> idToConstants = PartitionUtils.constantsMap(spec, file, fileSequenceNumber);
 
-    ParquetReadOptions.Builder optionsBuilder;
     if (inputFile instanceof HadoopInputFile) {
       // remove read properties already set that may conflict with this read
       Configuration conf = new Configuration(((HadoopInputFile) inputFile).getConf());
       for (String property : READ_PROPERTIES_TO_REMOVE) {
         conf.unset(property);
       }
-      optionsBuilder = HadoopReadOptions.builder(conf);
-    } else {
-      optionsBuilder = ParquetReadOptions.builder();
+      inputFile = HadoopInputFile.fromPath(((HadoopInputFile) inputFile).getPath(), conf);
     }
-    optionsBuilder =
-        optionsBuilder
-            .withRange(start, start + length)
-            .withMaxAllocationInBytes(MAX_FILE_BUFFER_SIZE);
 
     @Nullable String nameMapping = table.properties().get(TableProperties.DEFAULT_NAME_MAPPING);
     NameMapping mapping =
         nameMapping != null ? NameMappingParser.fromJson(nameMapping) : NameMapping.empty();
 
-    ParquetReader<Record> records =
-        new ParquetReader<>(
-            inputFile,
-            requiredSchema,
-            optionsBuilder.build(),
-            // TODO(ahmedabu98): Implement a Parquet-to-Beam Row reader, bypassing conversion to
-            // Iceberg Record
-            fileSchema ->
-                GenericParquetReaders.buildReader(requiredSchema, fileSchema, idToConstants),
-            mapping,
-            residual,
-            false,
-            true);
+    ReadBuilder<Record, ?> readerBuilder =
+        FormatModelRegistry.readBuilder(file.format(), Record.class, inputFile)
+            .split(start, length)
+            .project(requiredSchema)
+            .filter(residual)
+            .idToConstant(idToConstants)
+            .withNameMapping(mapping);
+    if (file.format() == FileFormat.PARQUET) {
+      readerBuilder.set("parquet.read.allocation.size", String.valueOf(MAX_FILE_BUFFER_SIZE));
+    }
+    CloseableIterable<Record> records = readerBuilder.build();
     return maybeApplyFilter(records, scanConfig, requiredSchema);
   }
 

@@ -27,6 +27,7 @@
 
 ## I/Os
 
+* (Java) IcebergIO now uses Iceberg's `FormatModelRegistry` SPI for file-format dispatch and supports ORC writes with `write.format.default=orc` ([#38925](https://github.com/apache/beam/issues/38925)).
 * Support for X source added (Java/Python) ([#X](https://github.com/apache/beam/issues/X)).
 
 ## New Features / Improvements
