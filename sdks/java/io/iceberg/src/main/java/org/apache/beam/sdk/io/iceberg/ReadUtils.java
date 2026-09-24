@@ -19,7 +19,6 @@ package org.apache.beam.sdk.io.iceberg;
 
 import static org.apache.iceberg.util.SnapshotUtil.ancestorsOf;
 
-import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -27,7 +26,6 @@ import java.util.stream.Collectors;
 import org.apache.beam.sdk.io.iceberg.IcebergIO.ReadRows.StartingStrategy;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.MoreObjects;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
-import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Sets;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.ContentScanTask;
@@ -57,12 +55,6 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 public class ReadUtils {
   // default is 8MB. keep this low to avoid overwhelming memory
   static final int MAX_FILE_BUFFER_SIZE = 1 << 18; // 256KB
-  private static final Collection<String> READ_PROPERTIES_TO_REMOVE =
-      Sets.newHashSet(
-          "parquet.read.filter",
-          "parquet.private.read.filter.predicate",
-          "parquet.read.support.class",
-          "parquet.crypto.factory.class");
 
   public static CloseableIterable<Record> createReader(
       ContentScanTask<?> task, Table table, IcebergScanConfig scanConfig) {
@@ -88,19 +80,12 @@ public class ReadUtils {
       long start,
       long length,
       Expression residual) {
+    InputFile rawInputFile =
+        configureParquetReadInput(file.format(), table.io().newInputFile(file.location()));
     EncryptedInputFile encryptedInput =
-        EncryptedFiles.encryptedInput(table.io().newInputFile(file.location()), file.keyMetadata());
+        EncryptedFiles.encryptedInput(rawInputFile, file.keyMetadata());
     InputFile inputFile = table.encryption().decrypt(encryptedInput);
     Map<Integer, ?> idToConstants = PartitionUtils.constantsMap(spec, file, fileSequenceNumber);
-
-    if (inputFile instanceof HadoopInputFile) {
-      // remove read properties already set that may conflict with this read
-      Configuration conf = new Configuration(((HadoopInputFile) inputFile).getConf());
-      for (String property : READ_PROPERTIES_TO_REMOVE) {
-        conf.unset(property);
-      }
-      inputFile = HadoopInputFile.fromPath(((HadoopInputFile) inputFile).getPath(), conf);
-    }
 
     @Nullable String nameMapping = table.properties().get(TableProperties.DEFAULT_NAME_MAPPING);
     NameMapping mapping =
@@ -113,11 +98,23 @@ public class ReadUtils {
             .filter(residual)
             .idToConstant(idToConstants)
             .withNameMapping(mapping);
-    if (file.format() == FileFormat.PARQUET) {
-      readerBuilder.set("parquet.read.allocation.size", String.valueOf(MAX_FILE_BUFFER_SIZE));
-    }
     CloseableIterable<Record> records = readerBuilder.build();
     return maybeApplyFilter(records, scanConfig, requiredSchema);
+  }
+
+  static InputFile configureParquetReadInput(FileFormat fileFormat, InputFile inputFile) {
+    // This configures normal (non-vectored) chunk allocation through HadoopInputFile only.
+    // Vectored reads bypass the allocation cap, and non-Hadoop inputs have no equivalent hook
+    // in Iceberg's current generic reader builder.
+    if (fileFormat != FileFormat.PARQUET || !(inputFile instanceof HadoopInputFile)) {
+      return inputFile;
+    }
+
+    HadoopInputFile hadoopInputFile = (HadoopInputFile) inputFile;
+    Configuration conf = new Configuration(hadoopInputFile.getConf());
+    conf.setInt("parquet.read.allocation.size", MAX_FILE_BUFFER_SIZE);
+    return HadoopInputFile.fromPath(
+        hadoopInputFile.getPath(), hadoopInputFile.getFileSystem(), conf);
   }
 
   public static @Nullable Long getFromSnapshotInclusive(Table table, IcebergScanConfig scanConfig) {
