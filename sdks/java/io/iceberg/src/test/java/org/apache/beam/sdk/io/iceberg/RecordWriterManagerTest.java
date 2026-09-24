@@ -33,6 +33,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
+import java.io.File;
 import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.ByteBuffer;
@@ -45,6 +46,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import org.apache.avro.file.DataFileReader;
+import org.apache.avro.generic.GenericDatumReader;
 import org.apache.beam.sdk.schemas.Schema;
 import org.apache.beam.sdk.schemas.logicaltypes.SqlTypes;
 import org.apache.beam.sdk.values.Row;
@@ -65,10 +68,14 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SortDirection;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.encryption.EncryptionManager;
+import org.apache.iceberg.encryption.KeyManagementClient;
+import org.apache.iceberg.encryption.StandardEncryptionManager;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
@@ -78,9 +85,13 @@ import org.apache.iceberg.types.Conversions;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.DateTimeUtil;
+import org.apache.orc.CompressionKind;
+import org.apache.orc.OrcFile;
+import org.apache.orc.Reader;
 import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
+import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 import org.apache.parquet.hadoop.util.HadoopInputFile;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.joda.time.DateTime;
@@ -1295,6 +1306,94 @@ public class RecordWriterManagerTest {
         "Bundle 2 should produce data files", bundle2.getSerializableDataFiles().containsKey(dest));
   }
 
+  private Table createUnpartitionedTable(String tableName) {
+    return warehouse.createTable(
+        TableIdentifier.of("default", tableName), ICEBERG_SCHEMA, PartitionSpec.unpartitioned());
+  }
+
+  private DataFile writeOneRecord(
+      Table table, FileFormat fileFormat, Map<String, String> writeProps) throws IOException {
+    PartitionKey partitionKey = new PartitionKey(table.spec(), table.schema());
+    RecordWriter writer =
+        new RecordWriter(table, fileFormat, testName.getMethodName(), partitionKey, writeProps);
+    writer.write(
+        IcebergUtils.beamRowToIcebergRecord(
+            ICEBERG_SCHEMA, Row.withSchema(BEAM_SCHEMA).addValues(1, "value", true).build()));
+    writer.close();
+    return writer.getDataFile();
+  }
+
+  private static void assertAvroCompression(DataFile dataFile, String expectedCodec)
+      throws IOException {
+    File localFile = new File(new Path(dataFile.path().toString()).toUri().getPath());
+    try (DataFileReader<Object> reader =
+        new DataFileReader<>(localFile, new GenericDatumReader<>())) {
+      assertEquals(expectedCodec, reader.getMetaString("avro.codec"));
+    }
+  }
+
+  @Test
+  public void testRecordWriterAppliesAvroTableCompression() throws IOException {
+    Table table = createUnpartitionedTable(testName.getMethodName());
+    table.updateProperties().set(TableProperties.AVRO_COMPRESSION, "snappy").commit();
+
+    assertAvroCompression(writeOneRecord(table, FileFormat.AVRO, null), "snappy");
+  }
+
+  @Test
+  public void testRecordWriterAppliesParquetTableCompression() throws IOException {
+    Table table = createUnpartitionedTable(testName.getMethodName());
+    table.updateProperties().set(TableProperties.PARQUET_COMPRESSION, "snappy").commit();
+    DataFile dataFile = writeOneRecord(table, FileFormat.PARQUET, null);
+
+    try (ParquetFileReader reader =
+        ParquetFileReader.open(
+            HadoopInputFile.fromPath(new Path(dataFile.path().toString()), new Configuration()))) {
+      for (BlockMetaData block : reader.getFooter().getBlocks()) {
+        for (ColumnChunkMetaData column : block.getColumns()) {
+          assertEquals(CompressionCodecName.SNAPPY, column.getCodec());
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testRecordWriterAppliesOrcTableCompression() throws IOException {
+    Table table = createUnpartitionedTable(testName.getMethodName());
+    table.updateProperties().set(TableProperties.ORC_COMPRESSION, "snappy").commit();
+    DataFile dataFile = writeOneRecord(table, FileFormat.ORC, null);
+
+    try (Reader reader =
+        OrcFile.createReader(
+            new Path(dataFile.path().toString()), OrcFile.readerOptions(new Configuration()))) {
+      assertEquals(CompressionKind.SNAPPY, reader.getCompressionKind());
+    }
+  }
+
+  @Test
+  public void testRecordWriterIgnoresAvroWriteProperties() throws IOException {
+    Table table = createUnpartitionedTable(testName.getMethodName());
+
+    assertAvroCompression(
+        writeOneRecord(
+            table, FileFormat.AVRO, ImmutableMap.of(TableProperties.AVRO_COMPRESSION, "snappy")),
+        "deflate");
+  }
+
+  @Test
+  public void testRecordWriterPropagatesEncryptionKeyMetadata() throws IOException {
+    Table table = createUnpartitionedTable(testName.getMethodName());
+    EncryptionManager encryptionManager =
+        new StandardEncryptionManager("table-key", 16, mock(KeyManagementClient.class));
+    Table spyTable = Mockito.spy(table);
+    Mockito.doReturn(encryptionManager).when(spyTable).encryption();
+
+    DataFile dataFile = writeOneRecord(spyTable, FileFormat.PARQUET, null);
+
+    assertNotNull(dataFile.keyMetadata());
+    assertTrue(dataFile.keyMetadata().hasRemaining());
+  }
+
   @Test
   public void testWritePropertiesAppliedToParquetFiles() throws IOException {
     Schema bloomSchema =
@@ -1303,7 +1402,12 @@ public class RecordWriterManagerTest {
         IcebergUtils.beamSchemaToIcebergSchema(bloomSchema);
 
     TableIdentifier tableId = TableIdentifier.of("default", "test_write_properties");
-    warehouse.createTable(tableId, icebergBloomSchema);
+    Table table = warehouse.createTable(tableId, icebergBloomSchema);
+    table
+        .updateProperties()
+        .set("write.parquet.bloom-filter-enabled.column.colWithBf", "false")
+        .set("write.parquet.bloom-filter-enabled.column.colWithoutBf", "true")
+        .commit();
 
     Map<String, String> writeProperties =
         ImmutableMap.of(

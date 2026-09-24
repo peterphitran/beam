@@ -91,9 +91,11 @@ class RecordWriter {
             .schema(table.schema())
             .spec(table.spec())
             .partition(partitionKey)
+            .keyMetadata(encryptedOutputFile.keyMetadata())
+            .setAll(table.properties())
             .metricsConfig(MetricsConfig.forTable(table))
             .overwrite();
-    if (writeProperties != null && !writeProperties.isEmpty()) {
+    if (fileFormat == FileFormat.PARQUET && writeProperties != null && !writeProperties.isEmpty()) {
       writerBuilder.setAll(writeProperties);
     }
     icebergDataWriter = writerBuilder.build();
