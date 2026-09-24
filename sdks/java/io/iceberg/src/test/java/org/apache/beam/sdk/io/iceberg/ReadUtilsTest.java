@@ -20,6 +20,8 @@ package org.apache.beam.sdk.io.iceberg;
 import static org.apache.beam.sdk.io.iceberg.IcebergIO.ReadRows.StartingStrategy.EARLIEST;
 import static org.apache.beam.sdk.io.iceberg.IcebergIO.ReadRows.StartingStrategy.LATEST;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertSame;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -34,19 +36,25 @@ import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Immuta
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.ImmutableMap;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Iterables;
 import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Lists;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
 import org.apache.iceberg.CombinedScanTask;
+import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.hadoop.HadoopInputFile;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.InputFile;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.junit.rules.TestName;
+import org.mockito.Mockito;
 
 /** Test class for {@link ReadUtils}. */
 public class ReadUtilsTest {
@@ -103,6 +111,32 @@ public class ReadUtilsTest {
       }
     }
     assertEquals(data.size(), numFiles);
+  }
+
+  @Test
+  public void testParquetReadAllocationSizeOnlyRewrapsHadoopParquetInput() throws IOException {
+    java.io.File tempFile = TEMPORARY_FOLDER.newFile();
+    Path path = new Path(tempFile.toURI());
+    Configuration conf = new Configuration();
+    conf.setInt("parquet.read.allocation.size", 8 * 1024 * 1024);
+    HadoopInputFile originalInput = HadoopInputFile.fromPath(path, conf);
+
+    InputFile configuredInput =
+        ReadUtils.configureParquetReadInput(FileFormat.PARQUET, originalInput);
+
+    assertNotSame(originalInput, configuredInput);
+    HadoopInputFile configuredHadoopInput = (HadoopInputFile) configuredInput;
+    assertSame(originalInput.getFileSystem(), configuredHadoopInput.getFileSystem());
+    assertEquals(
+        ReadUtils.MAX_FILE_BUFFER_SIZE,
+        configuredHadoopInput.getConf().getInt("parquet.read.allocation.size", 0));
+    assertEquals(
+        8 * 1024 * 1024, originalInput.getConf().getInt("parquet.read.allocation.size", 0));
+
+    assertSame(originalInput, ReadUtils.configureParquetReadInput(FileFormat.AVRO, originalInput));
+    InputFile nonHadoopInput = Mockito.mock(InputFile.class);
+    assertSame(
+        nonHadoopInput, ReadUtils.configureParquetReadInput(FileFormat.PARQUET, nonHadoopInput));
   }
 
   @Test
