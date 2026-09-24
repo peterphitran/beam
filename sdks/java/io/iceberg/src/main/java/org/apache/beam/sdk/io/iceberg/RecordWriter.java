@@ -23,18 +23,17 @@ import org.apache.beam.sdk.metrics.Counter;
 import org.apache.beam.sdk.metrics.Metrics;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.MetricsConfig;
 import org.apache.iceberg.PartitionKey;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.avro.Avro;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.encryption.EncryptedOutputFile;
-import org.apache.iceberg.encryption.EncryptionKeyMetadata;
+import org.apache.iceberg.formats.FileWriterBuilder;
+import org.apache.iceberg.formats.FormatModelRegistry;
 import org.apache.iceberg.io.DataWriter;
 import org.apache.iceberg.io.OutputFile;
-import org.apache.iceberg.parquet.Parquet;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -83,44 +82,23 @@ class RecordWriter {
           fileFormat.addExtension(
               table.locationProvider().newDataLocation(table.spec(), partitionKey, filename));
     }
-    OutputFile outputFile;
-    EncryptionKeyMetadata keyMetadata;
     // table.io() may return a shared FileIO instance.
     // FileIO lifecycle is managed by RecordWriterManager.close().
     OutputFile tmpFile = table.io().newOutputFile(absoluteFilename);
     EncryptedOutputFile encryptedOutputFile = table.encryption().encrypt(tmpFile);
-    outputFile = encryptedOutputFile.encryptingOutputFile();
-    keyMetadata = encryptedOutputFile.keyMetadata();
-
-    switch (fileFormat) {
-      case AVRO:
-        icebergDataWriter =
-            Avro.writeData(outputFile)
-                .forTable(table)
-                .createWriterFunc(org.apache.iceberg.data.avro.DataWriter::create)
-                .withPartition(partitionKey)
-                .withKeyMetadata(keyMetadata)
-                .overwrite()
-                .build();
-        break;
-      case PARQUET:
-        Parquet.DataWriteBuilder parquetBuilder =
-            Parquet.writeData(outputFile)
-                .forTable(table)
-                .createWriterFunc(GenericParquetWriter::create)
-                .withPartition(partitionKey)
-                .withKeyMetadata(keyMetadata)
-                .overwrite();
-        if (writeProperties != null && !writeProperties.isEmpty()) {
-          parquetBuilder.setAll(writeProperties);
-        }
-        icebergDataWriter = parquetBuilder.build();
-        break;
-      case ORC:
-        throw new UnsupportedOperationException("ORC file format not currently supported.");
-      default:
-        throw new RuntimeException("Unknown File Format: " + fileFormat);
+    FileWriterBuilder<DataWriter<Record>, ?> writerBuilder =
+        FormatModelRegistry.dataWriteBuilder(fileFormat, Record.class, encryptedOutputFile)
+            .schema(table.schema())
+            .spec(table.spec())
+            .partition(partitionKey)
+            .keyMetadata(encryptedOutputFile.keyMetadata())
+            .setAll(table.properties())
+            .metricsConfig(MetricsConfig.forTable(table))
+            .overwrite();
+    if (fileFormat == FileFormat.PARQUET && writeProperties != null && !writeProperties.isEmpty()) {
+      writerBuilder.setAll(writeProperties);
     }
+    icebergDataWriter = writerBuilder.build();
     activeIcebergWriters.inc();
     LOG.info(
         "Opened {} writer for table '{}', partition {}. Writing to path: {}",

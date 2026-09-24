@@ -34,21 +34,17 @@ import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
-import org.apache.iceberg.avro.Avro;
 import org.apache.iceberg.data.GenericDeleteFilter;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.data.avro.DataReader;
-import org.apache.iceberg.data.orc.GenericOrcReader;
-import org.apache.iceberg.data.parquet.GenericParquetReaders;
 import org.apache.iceberg.encryption.EncryptionManager;
 import org.apache.iceberg.encryption.InputFilesDecryptor;
+import org.apache.iceberg.formats.FormatModelRegistry;
+import org.apache.iceberg.formats.ReadBuilder;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.mapping.NameMappingParser;
-import org.apache.iceberg.orc.ORC;
-import org.apache.iceberg.parquet.Parquet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -125,61 +121,16 @@ class ScanTaskReader extends BoundedSource.BoundedReader<Row> {
       Map<Integer, ?> idToConstants =
           PartitionUtils.constantsMap(fileTask.spec(), fileTask.file(), null);
 
-      CloseableIterable<Record> iterable;
-      switch (file.format()) {
-        case ORC:
-          LOG.info("Preparing ORC input");
-          ORC.ReadBuilder orcReader =
-              ORC.read(input)
-                  .split(fileTask.start(), fileTask.length())
-                  .project(requiredSchema)
-                  .createReaderFunc(
-                      fileSchema ->
-                          GenericOrcReader.buildReader(requiredSchema, fileSchema, idToConstants))
-                  .filter(fileTask.residual());
-
-          if (nameMapping != null) {
-            orcReader.withNameMapping(NameMappingParser.fromJson(nameMapping));
-          }
-
-          iterable = orcReader.build();
-          break;
-        case PARQUET:
-          LOG.info("Preparing Parquet input.");
-          Parquet.ReadBuilder parquetReader =
-              Parquet.read(input)
-                  .split(fileTask.start(), fileTask.length())
-                  .project(requiredSchema)
-                  .createReaderFunc(
-                      fileSchema ->
-                          GenericParquetReaders.buildReader(
-                              requiredSchema, fileSchema, idToConstants))
-                  .filter(fileTask.residual());
-
-          if (nameMapping != null) {
-            parquetReader.withNameMapping(NameMappingParser.fromJson(nameMapping));
-          }
-
-          iterable = parquetReader.build();
-          break;
-        case AVRO:
-          LOG.info("Preparing Avro input.");
-          Avro.ReadBuilder avroReader =
-              Avro.read(input)
-                  .split(fileTask.start(), fileTask.length())
-                  .project(requiredSchema)
-                  .createReaderFunc(
-                      fileSchema -> DataReader.create(requiredSchema, fileSchema, idToConstants));
-
-          if (nameMapping != null) {
-            avroReader.withNameMapping(NameMappingParser.fromJson(nameMapping));
-          }
-
-          iterable = avroReader.build();
-          break;
-        default:
-          throw new UnsupportedOperationException("Cannot read format: " + file.format());
+      ReadBuilder<Record, ?> readerBuilder =
+          FormatModelRegistry.readBuilder(file.format(), Record.class, input)
+              .split(fileTask.start(), fileTask.length())
+              .project(requiredSchema)
+              .idToConstant(idToConstants)
+              .filter(fileTask.residual());
+      if (nameMapping != null) {
+        readerBuilder.withNameMapping(NameMappingParser.fromJson(nameMapping));
       }
+      CloseableIterable<Record> iterable = readerBuilder.build();
       GenericDeleteFilter deleteFilter =
           new GenericDeleteFilter(
               checkStateNotNull(io), fileTask, fileTask.schema(), requiredSchema);
